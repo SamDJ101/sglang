@@ -50,6 +50,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_model,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
@@ -320,7 +321,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_extend_attn_backend = None
 
         draft_backend_factory = DraftBackendFactory(
-            self.server_args,
             self.draft_runner,
             self.topk,
             self.speculative_num_steps,
@@ -859,7 +859,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         the verify-time WAR read-done publish. The returned tuple keeps the
         plan-time tensors alive for the post half. Returns None when the
         graph path is unavailable (caller falls back to legacy post-verify
-        sequencing and revokes the fastpath event)."""
+        sequencing and drops this step's read-done record)."""
         runner = self.cuda_graph_runner_for_draft_extend
         if runner is None or batch.forward_mode.is_idle():
             return None
@@ -912,9 +912,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     ):
         if planned is None:
             # Legacy sequencing reads shared buffers after the verify replay;
-            # revoke this step's fastpath event so the scheduler's WAR barrier
-            # takes the coarse whole-forward fence.
-            self.target_worker.model_runner.war_fastpath_read_done_event = None
+            # drop this step's record so the scheduler's WAR barrier takes the
+            # coarse whole-forward fence.
+            self.target_worker.model_runner.shared_read_done_event = None
             # Batch 2: Draft extend
             draft_extend_input = EagleDraftExtendInput(
                 hidden_states=batch_result.logits_output.hidden_states,
@@ -1106,7 +1106,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.gpu_id = gpu_id
         self.device = server_args.device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -1134,13 +1134,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
-
-    @property
-    def war_fastpath_runner(self):
-        # Publish moved to verify (target runner): draft_extend's shared-buffer
-        # reads run at plan time, before the verify launch, so verify is the
-        # step's last shared-buffer-reading phase.
-        return self.target_worker.model_runner
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -1592,7 +1585,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             plan_stream=self.plan_stream,
             plan_stream_ctx=self.plan_stream_ctx,
             topk=self.topk,
-            num_steps=self.speculative_num_steps,
             num_draft_tokens=self.speculative_num_draft_tokens,
             device=self.device,
             metadata_ready_pre_pad=False,

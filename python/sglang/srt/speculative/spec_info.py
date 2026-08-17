@@ -127,15 +127,6 @@ class SpeculativeAlgorithm(Enum):
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
 
-    def is_war_publish_phase(self, forward_mode) -> bool:
-        # The step's last shared-buffer-reading phase owns the WAR read-done
-        # publish. EAGLE qualifies at verify: draft_extend's shared-buffer
-        # reads run at plan time, before the verify launch (see
-        # _draft_extend_plan_for_decode).
-        if self.is_dflash_family() or self.is_eagle():
-            return forward_mode.is_target_verify()
-        return forward_mode.is_draft_extend_v2()
-
     def supports_ragged_verify(self) -> bool:
         """Whether this algorithm's verify step may carry a RaggedVerifyLayout
         (per-request verify lengths); gates the token-bucket-keyed verify
