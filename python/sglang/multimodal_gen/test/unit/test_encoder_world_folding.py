@@ -68,8 +68,8 @@ def _proposed_mode(tp, sp, cfg, dp=1, disagg=False, num_gpus=None, policy="auto"
 
 
 def test_pure_tp_not_folded():
-    # replica == tp under auto: each rank keeps a full encoder replica; auto
-    # never proposes folding here (the trade-off stays opt-in, see below).
+    # replica == tp under auto: the encoder already uses the DiT TP group, so
+    # no wider folding group needs to be proposed.
     assert _proposed_mode(tp=2, sp=1, cfg=1) is None
 
 
@@ -198,7 +198,7 @@ def test_group_size_one_not_folded():
 
 
 def test_unknown_dims_not_folded():
-    # a bare encoder whose dims we cannot introspect is left replicated (safe).
+    # A bare encoder whose dims we cannot introspect is not additionally folded.
     assert encoder_folding_worthwhile(TextEncoderConfig(), group_size=2) is False
 
 
@@ -271,7 +271,7 @@ def test_finalize_auto_keeps_wide_clears_narrow(monkeypatch):
 def test_finalize_auto_leaves_dp_capable_unsharded_when_dp_preferred(monkeypatch):
     # with a batch, dp (one all_gather) beats folding (an all_reduce per layer)
     assert _finalize(monkeypatch, 4096, 64, 10240, "auto", prefer_dp=True) is None
-    # TP or DiT-DP makes encoder DP ineligible, so keep the useful fold
+    # Without an explicit DP preference, keep the useful fold.
     assert _finalize(monkeypatch, 4096, 64, 10240, "auto") == "world"
     # CLIP-L cannot dp either, so folding remains the only question
     assert _finalize(monkeypatch, 768, 12, 3072, "auto", prefer_dp=True) is None
@@ -291,7 +291,7 @@ def test_finalize_fold_ignores_size_but_needs_divisible(monkeypatch):
 
 
 def test_finalize_mode_none_is_noop(monkeypatch):
-    # nothing proposed -> stays replicated regardless of policy.
+    # Nothing proposed: keep the encoder's existing DiT TP layout.
     assert _finalize(monkeypatch, 5120, 32, 32768, "auto", mode=None) is None
 
 

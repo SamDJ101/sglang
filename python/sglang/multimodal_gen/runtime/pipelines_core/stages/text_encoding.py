@@ -17,8 +17,8 @@ import torch
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.configs.pipeline_configs.base import TextConditioningOutput
 from sglang.multimodal_gen.runtime.distributed import (
+    get_encoder_data_parallel_group,
     get_local_torch_device,
-    get_replica_group,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
@@ -46,12 +46,13 @@ logger = init_logger(__name__)
 
 
 def _data_parallel_text_encode(forward_fn, forward_kwargs: dict, group):
-    """each rank encodes its 1/world_size batch slice, then all-gathers
+    """Each encoder copy encodes a batch slice, then all-gathers the outputs.
 
-    every rank runs the full unsharded encoder on its slice, so each row is
-    computed by the same kernels as the replicated forward; the batch is padded
-    to a multiple of world_size and padding rows are dropped after the gather.
-    Requires a TextEncoder (BaseEncoderOutput) -- see _text_encode_dp_group.
+    An encoder copy may itself be TP-sharded. Corresponding TP ranks use the
+    same batch-DP rank, so every rank in that TP group receives the same slice;
+    the orthogonal batch-DP groups then gather the replicated encoder outputs.
+    The batch is padded to a multiple of the DP degree and padding rows are
+    dropped after the gather. Requires a TextEncoder (BaseEncoderOutput).
     """
     world = group.world_size
     rank = group.rank_in_group
@@ -492,20 +493,16 @@ class TextEncodingStage(ConditionEncodingStage):
 
         return tok_kwargs
 
-    def _manage_text_encoder_use(self, encoder_index: int) -> None:
-        manager = self._component_residency_manager
-        if manager is None:
-            return
+    def _begin_text_encoder_use(self, encoder_index: int) -> None:
         component_name = (
             "text_encoder"
             if encoder_index == 0
             else f"text_encoder_{encoder_index + 1}"
         )
-        use = self._declared_component_use(component_name=component_name)
-        # TODO: Keep this begin-only interval until manager supports explicit
-        # declared-use interval grouping. Wrapping each encoder call separately
-        # can offload between positive and negative prompt encoding.
-        manager.begin_use(use, module=self.text_encoders[encoder_index])
+        self.begin_declared_component_use(
+            component_name=component_name,
+            module=self.text_encoders[encoder_index],
+        )
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):
@@ -519,17 +516,15 @@ class TextEncodingStage(ConditionEncodingStage):
     ):
         """group to data-parallel a batched text-encode over, or None
 
-        dp splits the request batch across ranks and all-gathers the outputs,
-        so each rank must hold a full encoder replica it can run alone. The
-        DiT's parallel layout is irrelevant to that: encoders are only ever
-        sharded through folding, which is gated on its own below, and the
-        split stays inside the replica group — the ranks that share this
-        batch — so pipeline replicas never mix requests.
+        DP splits the request batch across encoder copies and all-gathers the
+        outputs. A non-folded native encoder uses the DiT TP group, so this uses
+        the orthogonal non-TP ranks inside the same pipeline replica. It never
+        mixes requests across pipeline replicas and composes with DiT TP.
         """
         if server_args.encoder_parallel not in ("auto", "dp"):
             return None
-        # a folded encoder is sharded over its folding group, so a single rank
-        # cannot encode a batch slice by itself
+        # A folded encoder has one TP copy spanning its folding group, so there
+        # are no independent copies over which to split the batch.
         if encoder_config.parallel_folding_mode is not None:
             return None
         # the gather rebuilds a BaseEncoderOutput, which only a TextEncoder
@@ -540,8 +535,8 @@ class TextEncodingStage(ConditionEncodingStage):
             return None
         if not text_encoder.supports_dp_encode:
             return None
-        group = get_replica_group()
-        if group.world_size <= 1:
+        group = get_encoder_data_parallel_group()
+        if group is None or group.world_size <= 1:
             return None
         # explicit dp trusts the operator on an unmeasured topology; auto does not
         measured = server_args.encoder_parallel == "dp" or group_has_measured_topology(
@@ -557,7 +552,7 @@ class TextEncodingStage(ConditionEncodingStage):
             return
         self._dp_choice_logged = True
         logger.info(
-            "encoder_parallel: data-parallel text encode over %d ranks "
+            "encoder_parallel: data-parallel text encode over %d encoder copies "
             "(batch %d). Measured 1.9x on the encode stage at batch 2/4/8 "
             "(2xH100, T5-XXL width) with max_abs_diff=0 against the replicated "
             "forward.",
@@ -708,7 +703,7 @@ class TextEncodingStage(ConditionEncodingStage):
                 encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
-            self._manage_text_encoder_use(i)
+            self._begin_text_encoder_use(i)
             dp_group = self._text_encode_dp_group(
                 server_args, encoder_config, input_ids.shape[0], text_encoder
             )
